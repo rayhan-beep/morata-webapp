@@ -5,5 +5,13 @@
   },
   "deploy": {
     "startCommand": "npx serve -s build -l $PORT"
+  },
+  "nixpacks": {
+    "installCmd": "npm install --legacy-peer-deps"
   }
 }
+```
+
+Lalu di Railway dashboard → service frontend → **Settings** → cari **"Install Command"** → isi:
+```
+npm install --legacy-peer-deps
