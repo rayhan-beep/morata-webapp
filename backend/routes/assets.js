@@ -2,7 +2,7 @@ const router = require('express').Router();
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const multer = require('multer');
-const db = require('../models/database');
+const pool = require('../models/database');
 const { authenticate, authorize } = require('../middleware/auth');
 const audit = require('../middleware/audit');
 
@@ -12,109 +12,95 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
-// GET all with search/filter
-router.get('/', authenticate, (req, res) => {
+router.get('/', authenticate, async (req, res) => {
   const { search, city, type } = req.query;
   let q = "SELECT * FROM assets WHERE status='active'";
   const p = [];
+  let i = 1;
   if (search) {
-    q += ' AND (media_code LIKE ? OR name LIKE ? OR location LIKE ? OR city LIKE ?)';
-    p.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+    q += ` AND (media_code ILIKE $${i} OR name ILIKE $${i+1} OR location ILIKE $${i+2} OR city ILIKE $${i+3})`;
+    p.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`); i += 4;
   }
-  if (city) { q += ' AND city=?'; p.push(city); }
-  if (type) { q += ' AND type=?'; p.push(type); }
+  if (city) { q += ` AND city=$${i++}`; p.push(city); }
+  if (type) { q += ` AND type=$${i++}`; p.push(type); }
   q += ' ORDER BY media_code ASC, name ASC';
-  db.all(q, p, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+  try {
+    const { rows } = await pool.query(q, p);
     res.json(rows);
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET single
-router.get('/:id', authenticate, (req, res) => {
-  db.get('SELECT * FROM assets WHERE id=?', [req.params.id], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!row) return res.status(404).json({ error: 'Aset tidak ditemukan' });
-    res.json(row);
-  });
-});
-
-// GET cities
-router.get('/meta/cities', authenticate, (req, res) => {
-  db.all("SELECT DISTINCT city FROM assets WHERE status='active' ORDER BY city", [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+router.get('/meta/cities', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT DISTINCT city FROM assets WHERE status='active' ORDER BY city");
     res.json(rows.map(r => r.city));
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Check availability
-router.post('/:id/check-availability', authenticate, (req, res) => {
+router.get('/:id', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM assets WHERE id=$1', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Aset tidak ditemukan' });
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/:id/check-availability', authenticate, async (req, res) => {
   const { start_date, end_date, exclude_proposal_id } = req.body;
   if (!start_date || !end_date) return res.status(400).json({ error: 'Tanggal wajib diisi' });
-  let q = "SELECT * FROM bookings WHERE asset_id=? AND status='active' AND NOT (end_date < ? OR start_date > ?)";
+  let q = "SELECT * FROM bookings WHERE asset_id=$1 AND status='active' AND NOT (end_date < $2 OR start_date > $3)";
   const p = [req.params.id, start_date, end_date];
-  if (exclude_proposal_id) { q += ' AND proposal_id != ?'; p.push(exclude_proposal_id); }
-  db.all(q, p, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+  if (exclude_proposal_id) { q += ' AND proposal_id != $4'; p.push(exclude_proposal_id); }
+  try {
+    const { rows } = await pool.query(q, p);
     res.json({ available: rows.length === 0, conflicts: rows });
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// CREATE
-router.post('/', authenticate, authorize('admin'), upload.single('photo'), (req, res) => {
+router.post('/', authenticate, authorize('admin'), upload.single('photo'), async (req, res) => {
   const { media_code, name, type, location, city, rate_card, net_price, super_net_price, specs } = req.body;
-  if (!name || !type || !city || !net_price || !super_net_price) {
+  if (!name || !type || !city || !net_price || !super_net_price)
     return res.status(400).json({ error: 'Field wajib: name, type, city, net_price, super_net_price' });
-  }
   const id = uuidv4();
   const photo_url = req.file ? `/uploads/assets/${req.file.filename}` : null;
-  db.run(
-    'INSERT INTO assets (id,media_code,name,type,location,city,rate_card,net_price,super_net_price,photo_url,specs,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-    [id, media_code || null, name, type, location || null, city,
-     parseFloat(rate_card) || 0, parseFloat(net_price), parseFloat(super_net_price),
-     photo_url, specs || '{}', req.user.id],
-    function(err) {
-      if (err) return res.status(500).json({ error: err.message });
-      audit.log(req.user, 'CREATE_ASSET', 'asset', id, name);
-      res.status(201).json({ id, message: 'Aset berhasil dibuat' });
-    }
-  );
+  try {
+    await pool.query(
+      'INSERT INTO assets (id,media_code,name,type,location,city,rate_card,net_price,super_net_price,photo_url,specs,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)',
+      [id, media_code||null, name, type, location||null, city, parseFloat(rate_card)||0, parseFloat(net_price), parseFloat(super_net_price), photo_url, specs||'{}', req.user.id]
+    );
+    audit.log(req.user, 'CREATE_ASSET', 'asset', id, name);
+    res.status(201).json({ id, message: 'Aset berhasil dibuat' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// UPDATE
-router.put('/:id', authenticate, authorize('admin'), upload.single('photo'), (req, res) => {
+router.put('/:id', authenticate, authorize('admin'), upload.single('photo'), async (req, res) => {
   const { media_code, name, type, location, city, rate_card, net_price, super_net_price, specs, status } = req.body;
-  const sets = ['updated_at=CURRENT_TIMESTAMP'];
+  const sets = ['updated_at=NOW()'];
   const vals = [];
-  const addField = (col, val) => { if (val !== undefined && val !== null) { sets.push(`${col}=?`); vals.push(val); } };
-  addField('media_code', media_code);
-  addField('name', name);
-  addField('type', type);
-  addField('location', location);
-  addField('city', city);
-  addField('specs', specs);
-  addField('status', status);
-  if (rate_card !== undefined) { sets.push('rate_card=?'); vals.push(parseFloat(rate_card) || 0); }
-  if (net_price) { sets.push('net_price=?'); vals.push(parseFloat(net_price)); }
-  if (super_net_price) { sets.push('super_net_price=?'); vals.push(parseFloat(super_net_price)); }
-  if (req.file) { sets.push('photo_url=?'); vals.push(`/uploads/assets/${req.file.filename}`); }
+  let i = 1;
+  const add = (col, val) => { if (val !== undefined && val !== null && val !== '') { sets.push(`${col}=$${i++}`); vals.push(val); } };
+  add('media_code', media_code); add('name', name); add('type', type);
+  add('location', location); add('city', city); add('specs', specs); add('status', status);
+  if (rate_card !== undefined) { sets.push(`rate_card=$${i++}`); vals.push(parseFloat(rate_card)||0); }
+  if (net_price) { sets.push(`net_price=$${i++}`); vals.push(parseFloat(net_price)); }
+  if (super_net_price) { sets.push(`super_net_price=$${i++}`); vals.push(parseFloat(super_net_price)); }
+  if (req.file) { sets.push(`photo_url=$${i++}`); vals.push(`/uploads/assets/${req.file.filename}`); }
   vals.push(req.params.id);
-  db.run(`UPDATE assets SET ${sets.join(',')} WHERE id=?`, vals, function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!this.changes) return res.status(404).json({ error: 'Aset tidak ditemukan' });
-    audit.log(req.user, 'UPDATE_ASSET', 'asset', req.params.id, name || '');
+  try {
+    const { rowCount } = await pool.query(`UPDATE assets SET ${sets.join(',')} WHERE id=$${i}`, vals);
+    if (!rowCount) return res.status(404).json({ error: 'Aset tidak ditemukan' });
+    audit.log(req.user, 'UPDATE_ASSET', 'asset', req.params.id, name||'');
     res.json({ message: 'Aset diperbarui' });
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// DEACTIVATE
-router.delete('/:id', authenticate, authorize('admin'), (req, res) => {
-  db.run("UPDATE assets SET status='inactive',updated_at=CURRENT_TIMESTAMP WHERE id=?", [req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!this.changes) return res.status(404).json({ error: 'Aset tidak ditemukan' });
+router.delete('/:id', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const { rowCount } = await pool.query("UPDATE assets SET status='inactive',updated_at=NOW() WHERE id=$1", [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'Aset tidak ditemukan' });
     audit.log(req.user, 'DEACTIVATE_ASSET', 'asset', req.params.id);
     res.json({ message: 'Aset dinonaktifkan' });
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 module.exports = router;

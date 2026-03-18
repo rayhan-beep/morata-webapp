@@ -1,52 +1,53 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
-const db = require('../models/database');
+const pool = require('../models/database');
 const { authenticate, authorize } = require('../middleware/auth');
 
-router.get('/', authenticate, authorize('admin'), (req, res) => {
-  db.all('SELECT id,name,email,role,created_at FROM users ORDER BY name', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
+router.get('/', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT id,name,email,role,created_at FROM users ORDER BY name');
     res.json(rows);
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 router.post('/', authenticate, authorize('admin'), async (req, res) => {
   const { name, email, password, role } = req.body;
   if (!name || !email || !password || !role) return res.status(400).json({ error: 'Semua field wajib diisi' });
-  const hashed = await bcrypt.hash(password, 10);
-  const id = uuidv4();
-  db.run('INSERT INTO users (id,name,email,password,role) VALUES (?,?,?,?,?)', [id, name, email, hashed, role], function(err) {
-    if (err) {
-      if (err.message.includes('UNIQUE')) return res.status(409).json({ error: 'Email sudah digunakan' });
-      return res.status(500).json({ error: err.message });
-    }
+  try {
+    const hashed = await bcrypt.hash(password, 10);
+    const id = uuidv4();
+    await pool.query('INSERT INTO users (id,name,email,password,role) VALUES ($1,$2,$3,$4,$5)', [id, name, email, hashed, role]);
     res.status(201).json({ id, name, email, role });
-  });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Email sudah digunakan' });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 router.put('/:id', authenticate, authorize('admin'), async (req, res) => {
   const { name, email, role, password } = req.body;
-  const sets = ['updated_at=CURRENT_TIMESTAMP'];
+  const sets = ['updated_at=NOW()'];
   const vals = [];
-  if (name) { sets.push('name=?'); vals.push(name); }
-  if (email) { sets.push('email=?'); vals.push(email); }
-  if (role) { sets.push('role=?'); vals.push(role); }
-  if (password) { sets.push('password=?'); vals.push(await bcrypt.hash(password, 10)); }
+  let i = 1;
+  if (name) { sets.push(`name=$${i++}`); vals.push(name); }
+  if (email) { sets.push(`email=$${i++}`); vals.push(email); }
+  if (role) { sets.push(`role=$${i++}`); vals.push(role); }
+  if (password) { sets.push(`password=$${i++}`); vals.push(await bcrypt.hash(password, 10)); }
   vals.push(req.params.id);
-  db.run(`UPDATE users SET ${sets.join(',')} WHERE id=?`, vals, function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!this.changes) return res.status(404).json({ error: 'User tidak ditemukan' });
+  try {
+    const { rowCount } = await pool.query(`UPDATE users SET ${sets.join(',')} WHERE id=$${i}`, vals);
+    if (!rowCount) return res.status(404).json({ error: 'User tidak ditemukan' });
     res.json({ message: 'User diperbarui' });
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-router.delete('/:id', authenticate, authorize('admin'), (req, res) => {
-  db.run('DELETE FROM users WHERE id=?', [req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!this.changes) return res.status(404).json({ error: 'User tidak ditemukan' });
+router.delete('/:id', authenticate, authorize('admin'), async (req, res) => {
+  try {
+    const { rowCount } = await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'User tidak ditemukan' });
     res.json({ message: 'User dihapus' });
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 module.exports = router;
